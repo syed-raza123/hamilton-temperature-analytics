@@ -104,3 +104,33 @@ WHERE temperature_c > 30;
 SELECT COUNT(*) AS hours_below_zero
 FROM hamilton_weather
 WHERE temperature_c < 0;
+
+
+-- ========================================
+-- OCTOBER 16: AGGREGATION AND GROUPING
+-- ========================================
+-- Daily and hourly temperature analysis
+-- Dataset: Hamilton weather, 2025
+
+-- 1. Average daily temperature
+SELECT recorded_at::date AS weather_date,
+       ROUND(AVG(temperature_c), 1) AS daily_avg_c
+FROM hamilton_weather
+GROUP BY weather_date
+ORDER BY weather_date ASC;
+
+-- 2. Average temperature by hour of day
+SELECT EXTRACT(HOUR FROM recorded_at) AS hour_of_day,
+       ROUND(AVG(temperature_c), 1) AS hourly_avg_c
+FROM hamilton_weather
+GROUP BY hour_of_day
+ORDER BY hour_of_day DESC;
+
+-- 3. Daily minimum, maximum, and average
+SELECT recorded_at::date AS weather_date,
+       MIN(temperature_c) AS daily_min_c,
+       MAX(temperature_c) AS daily_max_c,
+       ROUND(AVG(temperature_c), 1) AS daily_avg_c
+FROM hamilton_weather
+GROUP BY weather_date
+ORDER BY weather_date ASC;
