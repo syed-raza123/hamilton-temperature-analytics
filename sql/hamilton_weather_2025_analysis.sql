@@ -134,3 +134,113 @@ SELECT recorded_at::date AS weather_date,
 FROM hamilton_weather
 GROUP BY weather_date
 ORDER BY weather_date ASC;
+
+
+-- ==================================================
+-- OCTOBER 17: REAL TEMPERATURE ANALYSIS
+-- Hamilton, Ontario | 2025 Hourly Weather Data
+-- ==================================================
+
+-- 1. WARMEST RECORDED HOUR
+SELECT recorded_at, temperature_c
+FROM hamilton_weather
+ORDER BY temperature_c DESC
+LIMIT 1;
+
+-- 2. COLDEST RECORDED HOUR
+SELECT recorded_at, temperature_c
+FROM hamilton_weather
+ORDER BY temperature_c ASC
+LIMIT 1;
+
+-- 3. WARMEST DAY BY AVERAGE TEMPERATURE
+SELECT
+    recorded_at::date AS day,
+    ROUND(AVG(temperature_c)::numeric, 2) AS avg_temp
+FROM hamilton_weather
+GROUP BY recorded_at::date
+ORDER BY avg_temp DESC
+LIMIT 1;
+
+-- 4. COLDEST DAY BY AVERAGE TEMPERATURE
+SELECT
+    recorded_at::date AS day,
+    ROUND(AVG(temperature_c)::numeric, 2) AS avg_temp
+FROM hamilton_weather
+GROUP BY recorded_at::date
+ORDER BY avg_temp ASC
+LIMIT 1;
+
+-- 5. DAILY TEMPERATURE RANGES
+SELECT
+    recorded_at::date AS day,
+    MAX(temperature_c) AS max_temp,
+    MIN(temperature_c) AS min_temp,
+    ROUND(
+        (MAX(temperature_c) - MIN(temperature_c))::numeric,
+        2
+    ) AS daily_range
+FROM hamilton_weather
+GROUP BY recorded_at::date
+ORDER BY day ASC;
+
+-- 6. TOP 5 DAYS WITH GREATEST FLUCTUATIONS
+SELECT
+    recorded_at::date AS day,
+    MAX(temperature_c) AS max_temp,
+    MIN(temperature_c) AS min_temp,
+    ROUND(
+        (MAX(temperature_c) - MIN(temperature_c))::numeric,
+        2
+    ) AS daily_range
+FROM hamilton_weather
+GROUP BY recorded_at::date
+ORDER BY daily_range DESC
+LIMIT 5;
+
+-- 7. MORNING VS AFTERNOON TEMPERATURES
+SELECT
+    CASE
+        WHEN EXTRACT(HOUR FROM recorded_at)
+            BETWEEN 6 AND 11
+        THEN 'Morning'
+        ELSE 'Afternoon'
+    END AS day_period,
+    ROUND(AVG(temperature_c)::numeric, 2) AS avg_temp_c,
+    COUNT(*) AS readings
+FROM hamilton_weather
+WHERE EXTRACT(HOUR FROM recorded_at)
+    BETWEEN 6 AND 17
+GROUP BY day_period
+ORDER BY day_period;
+
+-- 8. MONTHLY EXTREME TEMPERATURE FREQUENCY
+SELECT
+    EXTRACT(MONTH FROM recorded_at)::int AS month,
+    COUNT(*) FILTER (
+        WHERE temperature_c > 30
+    ) AS hot_hours,
+    COUNT(*) FILTER (
+        WHERE temperature_c < 0
+    ) AS freezing_hours
+FROM hamilton_weather
+GROUP BY EXTRACT(MONTH FROM recorded_at)
+ORDER BY month ASC;
+
+-- 9. FINAL DATA VERIFICATION
+SELECT
+    COUNT(*) AS total_readings,
+    COUNT(DISTINCT recorded_at) AS unique_timestamps,
+    COUNT(DISTINCT recorded_at::date) AS total_days,
+    MIN(recorded_at) AS first_timestamp,
+    MAX(recorded_at) AS last_timestamp,
+    MIN(temperature_c) AS min_temp,
+    MAX(temperature_c) AS max_temp,
+    COUNT(*) FILTER (
+        WHERE temperature_c > 30
+    ) AS hot_hours,
+    COUNT(*) FILTER (
+        WHERE temperature_c < 0
+    ) AS freezing_hours
+FROM hamilton_weather;
+
