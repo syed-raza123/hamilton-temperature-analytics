@@ -1,245 +1,749 @@
 
 """
 Hamilton Temperature Analytics
-Weather data pipeline
+Weather Data Pipeline
 
-This script will retrieve, process, and store
-Hamilton weather data.
+October 21 - Tasks 10, 11, and 13
+
+Extract, validate, load, reconcile, and log
+Hamilton's 2025 hourly weather data.
+
+The original database table is read-only.
 """
 
+import os
 from pathlib import Path
 
-import requests
 import pandas as pd
+import psycopg
+import requests
+from dotenv import load_dotenv
+from pipeline_logger import get_logger
 
-url = "https://archive-api.open-meteo.com/v1/archive"
 
-params = {
+# SETUP: Paths, credentials, and logging
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+load_dotenv(PROJECT_ROOT / ".env")
+
+logger = get_logger()
+
+API_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+API_PARAMS = {
     "latitude": 43.27,
     "longitude": -79.91,
     "start_date": "2025-01-01",
     "end_date": "2025-12-31",
     "hourly": "temperature_2m",
     "temperature_unit": "celsius",
-    "timezone": "America/Toronto"
+    "timezone": "America/Toronto",
 }
 
-try:
-    response = requests.get(url, params=params, timeout=60)
-    response.raise_for_status()
+START = pd.Timestamp("2025-01-01 00:00:00")
+END = pd.Timestamp("2025-12-31 23:00:00")
+EXPECTED_ROWS = 8760
 
-    data = response.json()
 
-    timestamps = data["hourly"]["time"]
-    temperatures = data["hourly"]["temperature_2m"]
+# DATABASE CONNECTION SETTINGS
 
-    print("First 5 timestamps:", timestamps[:5])
-    print("First 5 temperatures:", temperatures[:5])
+def connection_settings():
 
-    print("Total timestamps:", len(timestamps))
-    print("Total temperatures:", len(temperatures))
+    settings = {
+        "host": os.getenv("DB_HOST"),
+        "port": os.getenv("DB_PORT", "5432"),
+        "dbname": os.getenv("DB_NAME"),
+        "user": os.getenv("DB_USER"),
+        "password": os.getenv("DB_PASSWORD"),
+    }
 
-    # TASK 10: Convert API response into a pandas DataFrame
-    df = pd.DataFrame({
-        "recorded_at": timestamps,
-        "temperature_c": temperatures
-    })
+    missing = [
+        key
+        for key, value in settings.items()
+        if not value
+    ]
 
-    print("\nFirst 5 rows of the DataFrame:")
-    print(df.head())
+    if missing:
+        raise ValueError(
+            "Missing database settings: "
+            + ", ".join(missing)
+        )
 
-    # TASK 11: Inspect DataFrame columns
-    print("\nColumn names:")
-    print(df.columns)
+    if settings["dbname"] != "hamilton_temperature":
+        raise ValueError(
+            "Unexpected database name. Stopping for safety."
+        )
 
-    print("\nData types before conversion:")
-    print(df.dtypes)
+    return settings
 
-    # Convert timestamps into datetime objects
-    df["recorded_at"] = pd.to_datetime(df["recorded_at"])
 
-    print("\nData types after conversion:")
-    print(df.dtypes)
+# STEP 1: VALIDATE FRESH API DATA
 
-    print("\nDataFrame information:")
-    df.info()
+def validate_api(df):
 
-    print("\nFirst 5 rows after conversion:")
-    print(df.head())
+    if df.columns.tolist() != [
+        "recorded_at",
+        "temperature_c"
+    ]:
+        raise ValueError("Unexpected API columns.")
 
-    # TASK 12: Check for missing values
-    print("\nMissing values per column:")
-    print(df.isnull().sum())
+    df = df.copy()
 
-    # Check for duplicate timestamps
-    duplicate_count = df.duplicated(
-        subset=["recorded_at"]
-    ).sum()
+    df["recorded_at"] = pd.to_datetime(
+        df["recorded_at"],
+        errors="coerce"
+    )
 
-    print("\nDuplicate timestamps:", duplicate_count)
+    df["temperature_c"] = pd.to_numeric(
+        df["temperature_c"],
+        errors="coerce"
+    )
 
-    print("\nTotal rows:", len(df))
-    print("Unique timestamps:", df["recorded_at"].nunique())
+    if len(df) != EXPECTED_ROWS:
+        raise ValueError("Unexpected API row count.")
 
-    print("\nData validation summary:")
+    if df.isna().any().any():
+        raise ValueError("Missing or invalid API values.")
 
-    if df.isnull().sum().sum() == 0:
-        print("No missing values found.")
-    else:
-        print("Warning: Missing values detected.")
+    if df["recorded_at"].duplicated().any():
+        raise ValueError(
+            "Duplicate API timestamps detected."
+        )
 
-    if duplicate_count == 0:
-        print("No duplicate timestamps found.")
-    else:
-        print("Warning: Duplicate timestamps detected.")
+    if not df["temperature_c"].between(
+        -100, 100
+    ).all():
+        raise ValueError(
+            "API temperatures outside the safe range."
+        )
 
-    # TASK 13: Compare API data with original 2025 CSV
+    df = df.sort_values(
+        "recorded_at"
+    ).reset_index(drop=True)
 
-    # Locate project root and original cleaned CSV
-    project_root = Path(__file__).resolve().parent.parent
+    times = df["recorded_at"]
+
+    if (
+        times.iloc[0] != START
+        or times.iloc[-1] != END
+        or not times.diff().dropna().eq(
+            pd.Timedelta(hours=1)
+        ).all()
+    ):
+        raise ValueError(
+            "API timestamps are not a complete "
+            "hourly 2025 series."
+        )
+
+    print("SUCCESS: API validation passed.")
+    print("Validated records:", len(df))
+
+    logger.info(
+        "API validation passed: %d records, "
+        "no missing or duplicate hours.",
+        len(df)
+    )
+
+    return df
+
+
+# STEP 2: COMPARE WITH ORIGINAL CSV
+# READ-ONLY COMPARISON
+
+def compare_with_original_csv(api_df):
 
     original_path = (
-        project_root / "data" / "hamilton_weather_2025_clean.csv"
+        PROJECT_ROOT
+        / "data"
+        / "hamilton_weather_2025_clean.csv"
     )
-
-    print("\nOriginal CSV path:", original_path)
 
     if not original_path.exists():
-        print("Original cleaned CSV not found.")
-        print("Check the filename in your data folder.")
-
-    else:
-        # Load original dataset
-        original_df = pd.read_csv(original_path)
-
-        # Rename original CSV columns to match API DataFrame
-        original_df = original_df.rename(columns={
-            "time": "recorded_at",
-            "temperature_2m (°C)": "temperature_c"
-        })
-
-        print("\nOriginal CSV columns:")
-        print(original_df.columns.tolist())
-
-        # Standardize timestamp data types
-        original_df["recorded_at"] = pd.to_datetime(
-            original_df["recorded_at"]
+        raise ValueError(
+            "Original CSV missing. Import blocked."
         )
 
-        # Ensure temperatures are numeric
-        original_df["temperature_c"] = pd.to_numeric(
-            original_df["temperature_c"],
-            errors="coerce"
+    original_df = pd.read_csv(original_path)
+
+    original_df = original_df.rename(columns={
+        "time": "recorded_at",
+        "temperature_2m (°C)": "temperature_c",
+    })
+
+    if not {
+        "recorded_at",
+        "temperature_c"
+    }.issubset(original_df.columns):
+        raise ValueError(
+            "Original CSV has unexpected columns."
         )
 
-        # Compare row counts
-        print("\nOriginal CSV rows:", len(original_df))
-        print("New API rows:", len(df))
-
-        # Compare date ranges
-        print("\nOriginal date range:")
-        print(original_df["recorded_at"].min())
-        print(original_df["recorded_at"].max())
-
-        print("\nAPI date range:")
-        print(df["recorded_at"].min())
-        print(df["recorded_at"].max())
-
-        # Compare records by timestamp
-        comparison = original_df.merge(
-            df,
-            on="recorded_at",
-            how="outer",
-            suffixes=("_original", "_api"),
-            indicator=True,
-            validate="one_to_one"
-        )
-
-        print("\nTimestamp matching:")
-        print(comparison["_merge"].value_counts())
-
-        # Select timestamps found in both datasets
-        matched = comparison[
-            comparison["_merge"] == "both"
-        ].copy()
-
-        # Calculate absolute temperature differences
-        matched["temperature_difference"] = (
-            matched["temperature_c_original"]
-            - matched["temperature_c_api"]
-        ).abs()
-
-        # Count readings that differ by more than 0.01°C
-        different_readings = (
-            matched["temperature_difference"] > 0.01
-        ).sum()
-
-        print("\nReadings with temperature differences > 0.01°C:")
-        print(different_readings)
-
-        print("\nMaximum temperature difference:")
-        print(matched["temperature_difference"].max())
-
-        print("\nFirst 5 matching records:")
-        print(matched.head())
-
-        # Final comparison summary
-        print("\nTASK 13 COMPARISON SUMMARY")
-
-        timestamp_match = (
-            len(comparison) == len(df) == len(original_df)
-            and (comparison["_merge"] == "both").all()
-        )
-
-        temperature_match = (
-            len(matched) == len(df)
-            and matched["temperature_difference"].notna().all()
-            and (matched["temperature_difference"] <= 0.01).all()
-        )
-
-        if timestamp_match and temperature_match:
-            print("SUCCESS: Both datasets match within 0.01°C.")
-        else:
-            print("WARNING: Differences detected between datasets.")
-            print("Review the comparison results before proceeding.")
-
-    # TASK 14: Save processed API data to a separate CSV
-
-    output_path = (
-        project_root / "data" / "hamilton_weather_2025_api_processed.csv"
+    original_df["recorded_at"] = pd.to_datetime(
+        original_df["recorded_at"]
     )
 
-    # Prevent accidental overwriting
-    if output_path.exists():
-        print("\nProcessed API CSV already exists.")
-        print("File was not overwritten.")
+    original_df["temperature_c"] = pd.to_numeric(
+        original_df["temperature_c"],
+        errors="coerce"
+    )
+
+    comparison = original_df.merge(
+        api_df,
+        on="recorded_at",
+        how="outer",
+        suffixes=("_original", "_api"),
+        indicator=True,
+        validate="one_to_one",
+    )
+
+    matched = comparison.loc[
+        comparison["_merge"] == "both"
+    ].copy()
+
+    differences = (
+        matched["temperature_c_original"]
+        - matched["temperature_c_api"]
+    ).abs()
+
+    mismatch_count = int(
+        (differences > 0.01).sum()
+    )
+
+    print("\nORIGINAL CSV COMPARISON")
+
+    print("Original CSV rows:", len(original_df))
+    print("API rows:", len(api_df))
+    print("Matching timestamps:", len(matched))
+    print(
+        "Temperature differences > 0.01°C:",
+        mismatch_count
+    )
+
+    if len(matched) != EXPECTED_ROWS:
+        raise ValueError(
+            "Original CSV timestamps do not match "
+            "the API timestamps."
+        )
+
+    if mismatch_count:
+
+        print(
+            "WARNING: Original CSV and API "
+            "temperatures differ, as previously observed."
+        )
+
+        logger.warning(
+            "Original CSV differs from API in "
+            "%d readings; datasets remain separate.",
+            mismatch_count
+        )
 
     else:
-        # Save the processed DataFrame
-        df.to_csv(output_path, index=False)
 
-        print("\nProcessed API CSV saved successfully!")
-        print("Saved to:", output_path)
+        logger.info(
+            "Original CSV and API temperatures "
+            "agree within 0.01°C."
+        )
 
-    # Verify the saved CSV
-    saved_df = pd.read_csv(output_path)
 
-    print("\nSaved CSV row count:", len(saved_df))
-    print("Saved CSV columns:", saved_df.columns.tolist())
+# STEP 3: SAVE API CSV WITHOUT OVERWRITING
 
-    if len(saved_df) == 8760:
-        print("SUCCESS: Processed CSV contains 8760 rows.")
+def save_api_csv_without_overwriting(api_df):
+
+    output = (
+        PROJECT_ROOT
+        / "data"
+        / "hamilton_weather_2025_api_processed.csv"
+    )
+
+    if output.exists():
+
+        print(
+            "\nProcessed API CSV already exists; "
+            "it was not overwritten."
+        )
+
+        logger.info(
+            "Existing API CSV preserved "
+            "without overwriting."
+        )
+
     else:
-        print("WARNING: Unexpected number of rows.")
 
-except requests.exceptions.RequestException as error:
-    print("API request failed:", error)
+        api_df.to_csv(
+            output,
+            index=False
+        )
 
-except (KeyError, TypeError, ValueError) as error:
-    print("Error processing data:", error)
+        print(
+            "\nProcessed API CSV saved to:",
+            output
+        )
 
-except pd.errors.ParserError as error:
-    print("Error reading CSV:", error)
+        logger.info("Separate API CSV created.")
 
-except OSError as error:
-    print("File operation failed:", error)
+    saved = pd.read_csv(output)
+
+    print("Saved API CSV rows:", len(saved))
+
+    if len(saved) != EXPECTED_ROWS:
+        raise ValueError(
+            "Saved API CSV contains an unexpected "
+            "number of rows."
+        )
+
+
+# STEP 4: ORIGINAL POSTGRESQL SAFETY CHECK
+# READ-ONLY QUERY
+
+def original_stats(cursor):
+
+    cursor.execute("""
+        SELECT
+            COUNT(*),
+            COUNT(DISTINCT recorded_at),
+            MIN(temperature_c),
+            MAX(temperature_c)
+        FROM public.hamilton_weather;
+    """)
+
+    stats = cursor.fetchone()
+
+    if (
+        stats[0] != EXPECTED_ROWS
+        or stats[1] != EXPECTED_ROWS
+        or float(stats[2]) != -19.9
+        or float(stats[3]) != 36.2
+    ):
+        raise ValueError(
+            "Original PostgreSQL table "
+            "failed safety checks."
+        )
+
+    return stats
+
+
+# STEP 5: TASK 11 - RECONCILE FRESH API DATA
+
+def reconcile_fresh_api(
+    api_df,
+    database_rows
+):
+
+    db_df = pd.DataFrame(
+        database_rows,
+        columns=[
+            "recorded_at",
+            "temperature_c"
+        ]
+    )
+
+    db_df["recorded_at"] = pd.to_datetime(
+        db_df["recorded_at"],
+        errors="coerce"
+    )
+
+    db_df["temperature_c"] = pd.to_numeric(
+        db_df["temperature_c"],
+        errors="coerce"
+    )
+
+    if (
+        db_df.isna().any().any()
+        or db_df["recorded_at"].duplicated().any()
+    ):
+        raise ValueError(
+            "API database contains invalid values "
+            "or duplicate timestamps."
+        )
+
+    compared = api_df.merge(
+        db_df,
+        on="recorded_at",
+        how="outer",
+        suffixes=("_api", "_db"),
+        indicator=True,
+        validate="one_to_one",
+    )
+
+    matching = (
+        compared["_merge"] == "both"
+    )
+
+    missing = int(
+        (
+            compared["_merge"] == "left_only"
+        ).sum()
+    )
+
+    extra = int(
+        (
+            compared["_merge"] == "right_only"
+        ).sum()
+    )
+
+    matched = compared.loc[
+        matching
+    ].copy()
+
+    matched["difference"] = (
+        matched["temperature_c_api"]
+        - matched["temperature_c_db"]
+    ).abs()
+
+    mismatched = matched[
+        matched["difference"] > 0.01
+    ]
+
+    print(
+        "\nTASK 11: Post-Load Data Reconciliation"
+    )
+
+    print("Fresh API records:", len(api_df))
+    print("Database API records:", len(db_df))
+    print("Matching timestamps:", len(matched))
+    print("Missing database timestamps:", missing)
+    print("Extra database timestamps:", extra)
+
+    print(
+        "Temperature mismatches > 0.01°C:",
+        len(mismatched)
+    )
+
+    if len(mismatched):
+
+        print("First five mismatches:")
+
+        print(
+            mismatched[
+                [
+                    "recorded_at",
+                    "temperature_c_api",
+                    "temperature_c_db",
+                    "difference"
+                ]
+            ].head()
+        )
+
+    if (
+        len(db_df) != EXPECTED_ROWS
+        or len(matched) != EXPECTED_ROWS
+        or missing != 0
+        or extra != 0
+        or len(mismatched) != 0
+    ):
+        raise ValueError(
+            "Reconciliation failed; database "
+            "transaction will roll back."
+        )
+
+    print(
+        "SUCCESS: All reconciliation checks passed."
+    )
+
+    logger.info(
+        "Reconciliation passed: %d matching, "
+        "0 missing, 0 extra, 0 mismatches.",
+        len(matched)
+    )
+
+
+# STEP 6: MAIN WEATHER PIPELINE
+
+def main():
+
+    # TASK 13: START LOGGING
+
+    logger.info("Weather pipeline started.")
+
+    print(
+        "OCTOBER 21: Integrated weather pipeline "
+        "with Task 13 logging"
+    )
+
+    # EXTRACT DATA FROM OPEN METEO
+
+    response = requests.get(
+        API_URL,
+        params=API_PARAMS,
+        timeout=60
+    )
+
+    response.raise_for_status()
+
+    data = response.json()["hourly"]
+
+    df = pd.DataFrame({
+        "recorded_at": data["time"],
+        "temperature_c": data["temperature_2m"],
+    })
+
+    logger.info(
+        "Open-Meteo API extraction succeeded: "
+        "%d rows received.",
+        len(df)
+    )
+
+    print("\nFirst five API readings:")
+    print(df.head())
+
+    # VALIDATE DATA
+
+    api_df = validate_api(df)
+
+    # COMPARE WITHOUT MODIFYING ORIGINAL CSV
+
+    compare_with_original_csv(api_df)
+
+    # PRESERVE EXISTING API CSV
+
+    save_api_csv_without_overwriting(api_df)
+
+    # LOAD DATABASE SETTINGS
+
+    settings = connection_settings()
+
+    # READ ONLY POSTGRESQL CONNECTION
+
+    print(
+        "\nTASK 4: Read-Only PostgreSQL Connection"
+    )
+
+    with psycopg.connect(
+        **settings,
+        connect_timeout=5,
+        options="-c default_transaction_read_only=on"
+    ) as connection:
+
+        with connection.cursor() as cursor:
+
+            cursor.execute(
+                "SHOW transaction_read_only;"
+            )
+
+            if cursor.fetchone()[0] != "on":
+                raise ValueError(
+                    "Expected a read-only database connection."
+                )
+
+            original_stats(cursor)
+
+    print(
+        "SUCCESS: Original PostgreSQL data "
+        "matches expected results."
+    )
+
+    logger.info(
+        "Read-only original PostgreSQL "
+        "verification passed."
+    )
+
+    # TASK 10: SAFE API DATABASE LOADING
+
+    print(
+        "\nTASK 10: Automated PostgreSQL Pipeline"
+    )
+
+    records = [
+        (
+            timestamp.to_pydatetime(),
+            float(temperature)
+        )
+        for timestamp, temperature
+        in api_df.itertuples(
+            index=False,
+            name=None
+        )
+    ]
+
+    # Only this connection inserts records.
+    # All INSERT statements target the API table.
+
+    with psycopg.connect(
+        **settings,
+        connect_timeout=5
+    ) as connection:
+
+        with connection.cursor() as cursor:
+
+            before_original = original_stats(
+                cursor
+            )
+
+            print(
+                "SUCCESS: Original table safety "
+                "check passed."
+            )
+
+            # Confirm the separate API table exists
+
+            cursor.execute("""
+                SELECT to_regclass(
+                    'public.hamilton_weather_api_2025'
+                );
+            """)
+
+            if cursor.fetchone()[0] is None:
+                raise ValueError(
+                    "Separate API table is missing. "
+                    "Complete Task 9 setup first."
+                )
+
+            # Count existing API records
+
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM public.hamilton_weather_api_2025;
+            """)
+
+            before_count = cursor.fetchone()[0]
+
+            print(
+                "API table rows before:",
+                before_count
+            )
+
+            # Insert only timestamps not already stored
+
+            cursor.executemany("""
+                INSERT INTO public.hamilton_weather_api_2025 (
+                    recorded_at,
+                    temperature_c
+                )
+                VALUES (%s, %s)
+                ON CONFLICT (recorded_at) DO NOTHING;
+            """, records)
+
+            inserted = cursor.rowcount
+
+            print(
+                "New records inserted:",
+                inserted
+            )
+
+            logger.info(
+                "PostgreSQL API loading: %d rows "
+                "previously present, %d inserted.",
+                before_count,
+                inserted
+            )
+
+            # Validate API table statistics
+
+            cursor.execute("""
+                SELECT
+                    COUNT(*),
+                    COUNT(DISTINCT recorded_at),
+                    MIN(recorded_at),
+                    MAX(recorded_at)
+                FROM public.hamilton_weather_api_2025;
+            """)
+
+            (
+                count,
+                unique_count,
+                first,
+                last
+            ) = cursor.fetchone()
+
+            print("\nAPI TABLE VALIDATION")
+
+            print("Total records:", count)
+            print("Unique timestamps:", unique_count)
+            print("First timestamp:", first)
+            print("Last timestamp:", last)
+
+            if (
+                count != EXPECTED_ROWS
+                or unique_count != EXPECTED_ROWS
+                or first != START
+                or last != END
+            ):
+                raise ValueError(
+                    "API table validation failed; "
+                    "transaction will roll back."
+                )
+
+            # Verify original table was not changed
+
+            if original_stats(cursor) != before_original:
+                raise ValueError(
+                    "Original weather table "
+                    "safety check failed."
+                )
+
+            print(
+                "SUCCESS: Original table checks unchanged."
+            )
+
+            logger.info(
+                "Original table unchanged according "
+                "to recorded safety checks."
+            )
+
+            # TASK 11: POST LOAD RECONCILIATION
+
+            cursor.execute("""
+                SELECT
+                    recorded_at,
+                    temperature_c
+                FROM public.hamilton_weather_api_2025
+                ORDER BY recorded_at;
+            """)
+
+            reconcile_fresh_api(
+                api_df,
+                cursor.fetchall()
+            )
+
+    # The transaction commits only after all checks pass
+
+    print(
+        "\nSUCCESS: Task 10 pipeline completed."
+    )
+
+    print(
+        "SUCCESS: Task 11 reconciliation completed."
+    )
+
+    print(
+        "SUCCESS: Task 13 pipeline logging completed."
+    )
+
+    logger.info(
+        "Weather pipeline completed successfully; "
+        "database transaction committed."
+    )
+
+
+# STEP 7: TASK 13 LOG ERRORS SAFELY
+
+if __name__ == "__main__":
+
+    try:
+        main()
+
+    except (
+        requests.exceptions.RequestException,
+        psycopg.Error,
+        pd.errors.ParserError,
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError
+    ) as error:
+
+        print(
+            "ERROR: Pipeline failed:",
+            type(error).__name__
+        )
+
+        # Log error type, never the DB password
+
+        logger.error(
+            "Pipeline failed: %s.",
+            type(error).__name__
+        )
+
+        raise SystemExit(1) from error
