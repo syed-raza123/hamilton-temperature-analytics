@@ -244,3 +244,131 @@ SELECT
     ) AS freezing_hours
 FROM hamilton_weather;
 
+-- ============================================================
+-- OCTOBER 22: ADVANCED SQL JOIN ANALYSIS
+-- Hamilton Temperature Analytics | 2025
+-- ============================================================
+
+-- QUERY 1: Combine calendar and daily weather information
+-- Expected: 365 matching daily records
+
+SELECT
+    c.date,
+    c.day_name,
+    c.month_name,
+    c.is_weekend,
+    d.hourly_observations,
+    d.avg_temperature_c,
+    d.min_temperature_c,
+    d.max_temperature_c
+FROM public.calendar AS c
+INNER JOIN public.daily_temperature_summary AS d
+    ON c.date = d.weather_date
+ORDER BY c.date;
+
+
+-- QUERY 2: Identify calendar dates missing weather summaries
+-- Expected: 0 rows
+
+SELECT
+    c.date,
+    c.day_name
+FROM public.calendar AS c
+LEFT JOIN public.daily_temperature_summary AS d
+    ON c.date = d.weather_date
+WHERE d.weather_date IS NULL
+ORDER BY c.date;
+
+
+-- QUERY 3: Compare weekdays and weekends
+-- Finding: Weekends averaged 9.04 C;
+-- weekdays averaged 8.77 C.
+
+SELECT
+    CASE
+        WHEN c.is_weekend = TRUE THEN 'Weekend'
+        ELSE 'Weekday'
+    END AS day_type,
+    COUNT(*) AS total_days,
+    ROUND(AVG(d.avg_temperature_c), 2)
+        AS avg_temperature_c,
+    MIN(d.min_temperature_c)
+        AS lowest_temperature_c,
+    MAX(d.max_temperature_c)
+        AS highest_temperature_c
+FROM public.calendar AS c
+INNER JOIN public.daily_temperature_summary AS d
+    ON c.date = d.weather_date
+GROUP BY c.is_weekend
+ORDER BY c.is_weekend;
+
+
+-- QUERY 4: Monthly temperature analysis
+-- Finding: July was warmest at 23.97 C;
+-- February was coldest at -5.52 C.
+
+SELECT
+    c.month_number,
+    c.month_name,
+    COUNT(*) AS total_days,
+    ROUND(AVG(d.avg_temperature_c), 2)
+        AS avg_temperature_c,
+    MIN(d.min_temperature_c)
+        AS lowest_temperature_c,
+    MAX(d.max_temperature_c)
+        AS highest_temperature_c
+FROM public.calendar AS c
+INNER JOIN public.daily_temperature_summary AS d
+    ON c.date = d.weather_date
+GROUP BY c.month_number, c.month_name
+ORDER BY c.month_number;
+
+
+-- QUERY 5: Find the 10 hottest days of 2025
+-- Ranked by maximum hourly temperature
+-- Finding: June 23 reached 36.2 C.
+
+SELECT
+    c.date,
+    c.day_name,
+    c.month_name,
+    d.avg_temperature_c,
+    d.min_temperature_c,
+    d.max_temperature_c
+FROM public.calendar AS c
+INNER JOIN public.daily_temperature_summary AS d
+    ON c.date = d.weather_date
+ORDER BY d.max_temperature_c DESC,
+         c.date ASC
+LIMIT 10;
+
+
+-- QUERY 6: Validate joined record counts
+-- Expected: 365 days and 8760 hourly observations
+
+SELECT
+    COUNT(*) AS matched_days,
+    SUM(d.hourly_observations) AS total_hourly_records,
+    MIN(c.date) AS first_date,
+    MAX(c.date) AS last_date
+FROM public.calendar AS c
+INNER JOIN public.daily_temperature_summary AS d
+    ON c.date = d.weather_date;
+
+
+-- QUERY 7: Check for duplicate dates after the JOIN
+-- Expected: 0 rows
+
+SELECT
+    c.date,
+    COUNT(*) AS times_appearing
+FROM public.calendar AS c
+INNER JOIN public.daily_temperature_summary AS d
+    ON c.date = d.weather_date
+GROUP BY c.date
+HAVING COUNT(*) > 1
+ORDER BY c.date;
+
+-- ============================================================
+-- END OF OCTOBER 22 JOIN ANALYSIS
+-- ============================================================
